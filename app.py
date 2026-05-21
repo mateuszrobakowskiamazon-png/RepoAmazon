@@ -1,7 +1,7 @@
 """
-Amazon DE - Generator Tytułów (Streamlit)
-Łapie keywordy z Cerebro (Helium10), tytuły konkurencji, parametry produktu
-i generuje 3 wersje tytułu + plik Excel z analizą.
+Amazon Multi-Language - Generator Tytułów (Streamlit)
+Obsługuje DE / FR / IT / ES / NL / SE / EN / PL.
+Dodatkowo: tłumaczenie wygenerowanego tytułu na inny język (słownik strukturalny).
 """
 
 import re
@@ -13,35 +13,18 @@ import streamlit as st
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
+from languages import LANGUAGES, TRANSLATIONS
+
 
 # ===================== STAŁE =====================
 
-EXEMPT_WORDS = {
-    "und", "oder", "der", "die", "das", "für", "mit", "auf", "in", "zu",
-    "von", "aus", "bei", "am", "im", "als", "set", "cm", "er", "&",
-    "ein", "eine", "einen", "einer", "eines",
-}
-
 FORBIDDEN_CHARS = "!$?_{}^¬¦|"
 TITLE_LIMIT = 200
-
-# Cechy → ich formy przymiotnikowe dla wersji zdaniowej
-FEATURE_ADJ = {
-    "waschbar": "waschbare",
-    "rutschfest": "rutschfeste",
-    "wasserdicht": "wasserdichte",
-    "wetterfest": "wetterfeste",
-    "abnehmbar": "abnehmbare",
-    "gesteppt": "gesteppte",
-    "atmungsaktiv": "atmungsaktive",
-    "uv-beständig": "UV-beständige",
-}
 
 
 # ===================== PARSOWANIE =====================
 
 def parse_cerebro(uploaded_file) -> pd.DataFrame:
-    """Czyta plik Cerebro (Helium10) i zwraca top keywordy posortowane po SV."""
     df = pd.read_excel(uploaded_file)
     expected = ["Keyword Phrase", "Search Volume", "Keyword Sales"]
     if not all(c in df.columns for c in expected):
@@ -56,25 +39,21 @@ def parse_cerebro(uploaded_file) -> pd.DataFrame:
 
 
 def parse_competitor_titles(text: str) -> list[str]:
-    """Lista tytułów konkurencji - jeden per linia."""
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
-def extract_keywords_from_titles(titles: list[str]) -> list[tuple[str, int]]:
-    """Wyciąga najczęstsze słowa z tytułów konkurencji."""
+def extract_keywords_from_titles(titles: list[str], exempt: set) -> list[tuple[str, int]]:
     all_words = []
     for t in titles:
-        words = re.findall(r"[A-Za-zÄÖÜäöüß]+", t.lower())
-        all_words.extend(w for w in words if w not in EXEMPT_WORDS and len(w) > 3)
+        words = re.findall(r"[A-Za-zÄÖÜäöüßéèêàâçñíóúÁÉÍÓÚłąęśćźżńŁŚŻŹĆĄĘŃÅÄÖå]+", t.lower())
+        all_words.extend(w for w in words if w not in exempt and len(w) > 3)
     return Counter(all_words).most_common(20)
 
 
 # ===================== WALIDACJA =====================
 
-def validate_title(title: str, no_commas: bool = True) -> dict:
-    """Sprawdza zgodność z regułami Amazon DE od 21.01.2025."""
+def validate_title(title: str, lang: str, no_commas: bool = True) -> dict:
     issues = []
-
     if len(title) > TITLE_LIMIT:
         issues.append(f"Za długi: {len(title)}/{TITLE_LIMIT} znaków")
 
@@ -85,27 +64,21 @@ def validate_title(title: str, no_commas: bool = True) -> dict:
     if no_commas and "," in title:
         issues.append("Zawiera przecinki (wyłączone w ustawieniach)")
 
-    words = re.findall(r"[A-Za-zÄÖÜäöüß]+", title.lower())
-    counts = Counter(w for w in words if w not in EXEMPT_WORDS and len(w) > 1)
+    exempt = LANGUAGES[lang]["exempt_words"]
+    words = re.findall(r"[A-Za-zÄÖÜäöüßéèêàâçñíóúÁÉÍÓÚłąęśćźżńŁŚŻŹĆĄĘŃÅÄÖå]+", title.lower())
+    counts = Counter(w for w in words if w not in exempt and len(w) > 1)
     repeated = {w: c for w, c in counts.items() if c > 2}
     if repeated:
         issues.append(f"Powtórzenia 3+ razy: {repeated}")
 
-    return {
-        "length": len(title),
-        "valid": not issues,
-        "issues": issues,
-    }
+    return {"length": len(title), "valid": not issues, "issues": issues}
 
 
 # ===================== GENERATORY TYTUŁÓW =====================
 
-def join_parts(parts: list[str], sep: str = " ") -> str:
-    return sep.join(p for p in parts if p)
-
-
 def build_title(
     style: str,
+    lang: str,
     brand: str,
     main_kw: str,
     size: str,
@@ -118,110 +91,187 @@ def build_title(
     no_commas: bool,
 ) -> str:
     """style: 'A' (zlepek), 'B' (hybryda), 'C' (zdaniowa)"""
-
-    dash = " – "  # em dash
+    cfg = LANGUAGES[lang]
+    conn = cfg["connectors"]
+    dash = " – "
     amp = " & "
-    sep = " " if no_commas else ", "
+    feat_adj = cfg.get("feature_adj", {})
 
-    # zabezpiecz: brak duplikatów w synonimach i kontekstach
     syns = list(dict.fromkeys(s.strip() for s in synonyms if s.strip()))
     ctxs = list(dict.fromkeys(c.strip() for c in contexts if c.strip()))
     feats = [f.strip() for f in features if f.strip()]
 
     if style == "A":
-        # Klasyczny zlepek (jak top konkurencji)
-        parts = [
-            brand,
-            main_kw,
-            size,
-            set_size,
-            material,
-            dash,
-            *syns,
-            *feats,
-            "für",
-            *ctxs,
-        ]
+        parts = [brand, main_kw, size, set_size, material, dash, *syns, *feats]
+        if ctxs:
+            parts.append(conn["for"])
+            parts.extend(ctxs)
         title = " ".join(p for p in parts if p)
         if color:
             title += dash + color
-        return title
+        return title.replace("  ", " ").strip()
 
     if style == "B":
-        # Hybryda - bardziej naturalne, z & jako separatorem
         feat_str = " ".join(feats)
-        syn_block = amp.join(syns[:2]) + " " + " ".join(syns[2:]) if len(syns) > 2 else amp.join(syns)
-        ctx_block = " ".join(ctxs[:-1]) + amp + ctxs[-1] if len(ctxs) > 1 else (ctxs[0] if ctxs else "")
+        if len(syns) > 2:
+            syn_block = amp.join(syns[:2]) + " " + " ".join(syns[2:])
+        elif syns:
+            syn_block = amp.join(syns)
+        else:
+            syn_block = ""
 
-        parts = [
-            brand,
-            main_kw,
-            size,
-            set_size,
-            "aus",
-            material,
-            feat_str,
-            dash,
-            syn_block,
-            "für",
-            ctx_block,
-        ]
-        title = " ".join(p for p in parts if p).replace("  ", " ")
+        if len(ctxs) > 1:
+            ctx_block = " ".join(ctxs[:-1]) + amp + ctxs[-1]
+        elif ctxs:
+            ctx_block = ctxs[0]
+        else:
+            ctx_block = ""
+
+        parts = [brand, main_kw, size, set_size]
+        if material:
+            parts.extend([conn["from"], material])
+        if feat_str:
+            parts.append(feat_str)
+        if syn_block:
+            parts.extend([dash, syn_block])
+        if ctx_block:
+            parts.extend([conn["for"], ctx_block])
+        title = " ".join(p for p in parts if p)
         if color:
             title += dash + color
-        return title
+        return title.replace("  ", " ").strip()
 
     if style == "C":
-        # Zdaniowa - najczystsza, zgodna z duchem nowych reguł Amazon
-        adj_form = FEATURE_ADJ.get(feats[0].lower(), feats[0] + "e") if feats else ""
+        if feats:
+            first_feat = feats[0].lower()
+            adj_form = feat_adj.get(first_feat, feats[0])
+        else:
+            adj_form = ""
         main_syn = syns[0] if syns else main_kw
         other_syns = syns[1:]
-        ctx_str = " ".join(ctxs[:-1]) + " und " + ctxs[-1] if len(ctxs) > 1 else (ctxs[0] if ctxs else "")
+        if len(ctxs) > 1:
+            ctx_str = " ".join(ctxs[:-1]) + f" {conn['and']} " + ctxs[-1]
+        elif ctxs:
+            ctx_str = ctxs[0]
+        else:
+            ctx_str = ""
 
-        parts = [
-            brand,
-            main_kw,
-            size,
-            "aus",
-            material,
-            set_size,
-            dash,
-            f"{adj_form} {main_syn}".strip(),
-            "für",
-            ctx_str,
-        ]
+        parts = [brand, main_kw, size]
+        if material:
+            parts.extend([conn["from"], material])
+        if set_size:
+            parts.append(set_size)
+        parts.append(dash)
+        if adj_form:
+            parts.append(adj_form)
+        parts.append(main_syn)
+        if ctx_str:
+            parts.extend([conn["for"], ctx_str])
         if other_syns:
             parts.extend([dash, amp.join(other_syns[:2])])
 
-        title = " ".join(p for p in parts if p).replace("  ", " ")
+        title = " ".join(p for p in parts if p)
         if color:
             title += dash + color
-        return title
+        return title.replace("  ", " ").strip()
 
     raise ValueError(f"Nieznany styl: {style}")
 
 
-def trim_to_fit(title_fn, max_len: int = TITLE_LIMIT, **kwargs) -> str:
-    """Jeśli tytuł za długi, stopniowo wycina konteksty/synonimy."""
-    title = title_fn(**kwargs)
+def trim_to_fit(style: str, max_len: int = TITLE_LIMIT, **kwargs) -> str:
+    """Auto-przycinanie kontekstów i synonimów żeby zmieścić w 200 zn."""
+    title = build_title(style=style, **kwargs)
     if len(title) <= max_len:
         return title
 
-    # próbuj wycinać konteksty od końca
     contexts = list(kwargs.get("contexts", []))
     while contexts and len(title) > max_len:
         contexts.pop()
         kwargs["contexts"] = contexts
-        title = title_fn(**kwargs)
+        title = build_title(style=style, **kwargs)
 
-    # potem synonimy
     syns = list(kwargs.get("synonyms", []))
     while len(syns) > 2 and len(title) > max_len:
         syns.pop()
         kwargs["synonyms"] = syns
-        title = title_fn(**kwargs)
+        title = build_title(style=style, **kwargs)
 
     return title
+
+
+# ===================== TŁUMACZENIE TYTUŁU =====================
+
+def build_reverse_translations() -> dict:
+    """Buduje słownik wieloznaczny: dowolne słowo (w dowolnym języku) → klucz DE."""
+    reverse = {}
+    for de_word, langs in TRANSLATIONS.items():
+        reverse[de_word.lower()] = de_word
+        for _, trans in langs.items():
+            reverse[trans.lower()] = de_word
+    return reverse
+
+
+def translate_title(title: str, from_lang: str, to_lang: str) -> tuple[str, list[str]]:
+    """
+    Tłumaczy tytuł na docelowy język.
+    Strategia: identyfikuje znane słowa (przez słownik DE-jako-pivot), mapuje
+    łączniki/set/separatory, pozostałe słowa zostawia z oznaczeniem.
+    Zwraca: (przetłumaczony tytuł, lista nieznanych słów).
+    """
+    if from_lang == to_lang:
+        return title, []
+
+    src_cfg = LANGUAGES[from_lang]
+    dst_cfg = LANGUAGES[to_lang]
+
+    # Mapowanie set_sizes: szukamy fragmentu set_size source i zamieniamy na target
+    for key, src_val in src_cfg["set_sizes"].items():
+        dst_val = dst_cfg["set_sizes"][key]
+        if src_val in title:
+            title = title.replace(src_val, dst_val)
+            break
+
+    # Mapowanie łączników (für → pour itp.)
+    src_conn = src_cfg["connectors"]
+    dst_conn = dst_cfg["connectors"]
+    for key in ["for", "from", "and", "or"]:
+        src_w = src_conn[key]
+        dst_w = dst_conn[key]
+        # Zamieniamy całe słowa (z ograniczeniami granic słowa)
+        title = re.sub(rf"\b{re.escape(src_w)}\b", dst_w, title, flags=re.IGNORECASE)
+
+    # Słownikowe tłumaczenie - słowo po słowie z zachowaniem separatorów
+    reverse_dict = build_reverse_translations()
+    unknown_words = []
+
+    def translate_word(match):
+        word = match.group(0)
+        word_lower = word.lower()
+        if word_lower in reverse_dict:
+            de_key = reverse_dict[word_lower]
+            if to_lang == "DE":
+                return de_key
+            translations = TRANSLATIONS.get(de_key, {})
+            if to_lang in translations:
+                return translations[to_lang]
+        # Nie znamy - pomijamy z listy nieznanych jeśli to nie jest exempt
+        if (word_lower not in src_cfg["exempt_words"]
+                and word_lower not in dst_cfg["exempt_words"]
+                and len(word) > 2
+                and not word_lower.isdigit()
+                and not re.match(r"^\d+x\d+$", word_lower)
+                and word_lower not in {"cm", "mm", "kg", "g", "ml"}):
+            unknown_words.append(word)
+        return word
+
+    # Tokenizuj po słowach (zachowując spacje i znaki interpunkcyjne)
+    pattern = r"[A-Za-zÄÖÜäöüßéèêàâçñíóúÁÉÍÓÚłąęśćźżńŁŚŻŹĆĄĘŃÅÄÖå]+"
+    translated = re.sub(pattern, translate_word, title)
+
+    # Usuń duplikaty z nieznanych
+    unknown_words = list(dict.fromkeys(unknown_words))
+
+    return translated.replace("  ", " ").strip(), unknown_words
 
 
 # ===================== EXCEL OUTPUT =====================
@@ -232,9 +282,11 @@ def build_excel(
     competitor_titles: list[str],
     backend_terms: str,
     product_params: dict,
+    translated: dict | None = None,
 ) -> bytes:
-    """Buduje plik Excel z 5 arkuszami i zwraca jako bajty."""
     wb = Workbook()
+    thin = Side(border_style="thin", color="CCCCCC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     # === Arkusz 1: Opcje tytułów ===
     ws = wb.active
@@ -246,19 +298,16 @@ def build_excel(
         c.fill = PatternFill("solid", start_color="2C3E50")
         c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    style_descriptions = {
+    style_desc = {
         "A": "A – Klasyczny zlepek",
         "B": "B – Hybryda (REKOMENDOWANE)",
         "C": "C – Zdaniowa naturalna",
     }
     fills = {"A": "FFF3CD", "B": "D4EDDA", "C": "D1ECF1"}
 
-    thin = Side(border_style="thin", color="CCCCCC")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
     for r_idx, style in enumerate(["A", "B", "C"], 2):
         data = titles[style]
-        ws.cell(row=r_idx, column=1, value=style_descriptions[style])
+        ws.cell(row=r_idx, column=1, value=style_desc[style])
         ws.cell(row=r_idx, column=2, value=data["title"])
         ws.cell(row=r_idx, column=3, value=f"{data['length']} zn.")
         ws.cell(row=r_idx, column=4, value="✅ OK" if data["valid"] else "❌ Problem")
@@ -278,68 +327,96 @@ def build_excel(
     for r in range(2, 5):
         ws.row_dimensions[r].height = 90
 
-    # === Arkusz 2: Top słowa kluczowe ===
-    ws2 = wb.create_sheet("Top słowa kluczowe")
-    kw_headers = ["#", "Słowo kluczowe", "Search Volume", "Keyword Sales"]
-    for col, h in enumerate(kw_headers, 1):
-        c = ws2.cell(row=1, column=col, value=h)
-        c.font = Font(bold=True, color="FFFFFF", name="Arial")
-        c.fill = PatternFill("solid", start_color="2C3E50")
-        c.alignment = Alignment(horizontal="center", vertical="center")
+    # === Arkusz 2: Tłumaczenia (jeśli są) ===
+    if translated:
+        ws_t = wb.create_sheet("Tłumaczenia")
+        ws_t["A1"] = "Tytuły przetłumaczone na inne języki"
+        ws_t["A1"].font = Font(bold=True, size=12, name="Arial")
+        ws_t.cell(row=3, column=1, value="Język").font = Font(bold=True, name="Arial")
+        ws_t.cell(row=3, column=2, value="Opcja").font = Font(bold=True, name="Arial")
+        ws_t.cell(row=3, column=3, value="Tytuł").font = Font(bold=True, name="Arial")
+        ws_t.cell(row=3, column=4, value="Długość").font = Font(bold=True, name="Arial")
+        ws_t.cell(row=3, column=5, value="Nieznane słowa").font = Font(bold=True, name="Arial")
 
-    top_kws = cerebro_df.head(20)
-    for r_idx, (_, row) in enumerate(top_kws.iterrows(), 2):
-        ws2.cell(row=r_idx, column=1, value=r_idx - 1)
-        ws2.cell(row=r_idx, column=2, value=row["Keyword Phrase"])
-        ws2.cell(row=r_idx, column=3, value=int(row["Search Volume"]) if pd.notna(row["Search Volume"]) else "-")
-        ws2.cell(row=r_idx, column=4, value=int(row["Keyword Sales"]) if pd.notna(row["Keyword Sales"]) else "-")
-        for col in range(1, 5):
-            cell = ws2.cell(row=r_idx, column=col)
-            cell.font = Font(name="Arial", size=10)
-            cell.alignment = Alignment(vertical="center")
-            cell.border = border
-            if r_idx <= 4:
-                cell.fill = PatternFill("solid", start_color="FFEAA7")
+        row = 4
+        for lang_code, data in translated.items():
+            for style, info in data["titles"].items():
+                ws_t.cell(row=row, column=1, value=LANGUAGES[lang_code]["name"])
+                ws_t.cell(row=row, column=2, value=style)
+                ws_t.cell(row=row, column=3, value=info["title"])
+                ws_t.cell(row=row, column=4, value=f"{len(info['title'])} zn.")
+                ws_t.cell(row=row, column=5, value=", ".join(info.get("unknown", [])))
+                for col in range(1, 6):
+                    ws_t.cell(row=row, column=col).font = Font(name="Arial", size=10)
+                    ws_t.cell(row=row, column=col).alignment = Alignment(wrap_text=True, vertical="top")
+                    ws_t.cell(row=row, column=col).border = border
+                row += 1
+        ws_t.column_dimensions["A"].width = 25
+        ws_t.column_dimensions["B"].width = 10
+        ws_t.column_dimensions["C"].width = 70
+        ws_t.column_dimensions["D"].width = 12
+        ws_t.column_dimensions["E"].width = 35
 
-    ws2.column_dimensions["A"].width = 5
-    ws2.column_dimensions["B"].width = 40
-    ws2.column_dimensions["C"].width = 15
-    ws2.column_dimensions["D"].width = 15
+    # === Arkusz 3: Top słowa kluczowe (jeśli Cerebro wgrane) ===
+    if not cerebro_df.empty:
+        ws2 = wb.create_sheet("Top słowa kluczowe")
+        for col, h in enumerate(["#", "Słowo kluczowe", "Search Volume", "Keyword Sales"], 1):
+            c = ws2.cell(row=1, column=col, value=h)
+            c.font = Font(bold=True, color="FFFFFF", name="Arial")
+            c.fill = PatternFill("solid", start_color="2C3E50")
+            c.alignment = Alignment(horizontal="center", vertical="center")
 
-    # === Arkusz 3: Backend Search Terms ===
-    ws3 = wb.create_sheet("Backend Search Terms")
-    ws3["A1"] = "Backend Search Terms (Seller Central → Schlüsselwörter)"
-    ws3["A1"].font = Font(bold=True, size=12, name="Arial")
-    ws3["A2"] = "Wklej do pola „Allgemeine Schlüsselwörter” w Seller Central. Limit Amazon DE: 249 znaków."
-    ws3["A2"].font = Font(italic=True, size=9, color="666666", name="Arial")
-    ws3["A2"].alignment = Alignment(wrap_text=True)
-    ws3["A4"] = "Sugerowane słowa kluczowe do backendu:"
-    ws3["A4"].font = Font(bold=True, name="Arial")
-    ws3["A5"] = backend_terms
-    ws3["A5"].font = Font(name="Arial", size=10)
-    ws3["A5"].alignment = Alignment(wrap_text=True, vertical="top")
-    ws3["A5"].fill = PatternFill("solid", start_color="F0F0F0")
-    ws3["A6"] = f"Długość: {len(backend_terms)} znaków / 249"
-    ws3["A6"].font = Font(italic=True, size=9, color="666666", name="Arial")
-    ws3.column_dimensions["A"].width = 90
-    ws3.row_dimensions[5].height = 60
+        for r_idx, (_, row_data) in enumerate(cerebro_df.head(20).iterrows(), 2):
+            ws2.cell(row=r_idx, column=1, value=r_idx - 1)
+            ws2.cell(row=r_idx, column=2, value=row_data["Keyword Phrase"])
+            ws2.cell(row=r_idx, column=3, value=int(row_data["Search Volume"]) if pd.notna(row_data["Search Volume"]) else "-")
+            ws2.cell(row=r_idx, column=4, value=int(row_data["Keyword Sales"]) if pd.notna(row_data["Keyword Sales"]) else "-")
+            for col in range(1, 5):
+                cell = ws2.cell(row=r_idx, column=col)
+                cell.font = Font(name="Arial", size=10)
+                cell.border = border
+                if r_idx <= 4:
+                    cell.fill = PatternFill("solid", start_color="FFEAA7")
 
-    # === Arkusz 4: Konkurencja ===
-    ws4 = wb.create_sheet("Konkurencja")
-    ws4["A1"] = "Tytuły konkurencji (wklejone)"
-    ws4["A1"].font = Font(bold=True, size=12, name="Arial")
-    for i, t in enumerate(competitor_titles, 3):
-        ws4.cell(row=i, column=1, value=f"#{i-2}")
-        ws4.cell(row=i, column=2, value=t)
-        ws4.cell(row=i, column=3, value=f"{len(t)} zn.")
-        for col in range(1, 4):
-            ws4.cell(row=i, column=col).font = Font(name="Arial", size=10)
-            ws4.cell(row=i, column=col).alignment = Alignment(wrap_text=True, vertical="top")
-    ws4.column_dimensions["A"].width = 5
-    ws4.column_dimensions["B"].width = 90
-    ws4.column_dimensions["C"].width = 12
+        ws2.column_dimensions["A"].width = 5
+        ws2.column_dimensions["B"].width = 40
+        ws2.column_dimensions["C"].width = 15
+        ws2.column_dimensions["D"].width = 15
 
-    # === Arkusz 5: Parametry użyte ===
+    # === Arkusz 4: Backend ===
+    if backend_terms:
+        ws3 = wb.create_sheet("Backend Search Terms")
+        ws3["A1"] = "Backend Search Terms (Seller Central → Schlüsselwörter / Keywords)"
+        ws3["A1"].font = Font(bold=True, size=12, name="Arial")
+        ws3["A2"] = "Wklej do pola „Allgemeine Schlüsselwörter / General Keywords”. Limit Amazon: 249 znaków."
+        ws3["A2"].font = Font(italic=True, size=9, color="666666", name="Arial")
+        ws3["A2"].alignment = Alignment(wrap_text=True)
+        ws3["A4"] = backend_terms
+        ws3["A4"].font = Font(name="Arial", size=10)
+        ws3["A4"].alignment = Alignment(wrap_text=True, vertical="top")
+        ws3["A4"].fill = PatternFill("solid", start_color="F0F0F0")
+        ws3["A5"] = f"Długość: {len(backend_terms)} znaków / 249"
+        ws3["A5"].font = Font(italic=True, size=9, color="666666", name="Arial")
+        ws3.column_dimensions["A"].width = 90
+        ws3.row_dimensions[4].height = 60
+
+    # === Arkusz 5: Konkurencja ===
+    if competitor_titles:
+        ws4 = wb.create_sheet("Konkurencja")
+        ws4["A1"] = "Tytuły konkurencji (wklejone)"
+        ws4["A1"].font = Font(bold=True, size=12, name="Arial")
+        for i, t in enumerate(competitor_titles, 3):
+            ws4.cell(row=i, column=1, value=f"#{i-2}")
+            ws4.cell(row=i, column=2, value=t)
+            ws4.cell(row=i, column=3, value=f"{len(t)} zn.")
+            for col in range(1, 4):
+                ws4.cell(row=i, column=col).font = Font(name="Arial", size=10)
+                ws4.cell(row=i, column=col).alignment = Alignment(wrap_text=True, vertical="top")
+        ws4.column_dimensions["A"].width = 5
+        ws4.column_dimensions["B"].width = 90
+        ws4.column_dimensions["C"].width = 12
+
+    # === Arkusz 6: Parametry ===
     ws5 = wb.create_sheet("Parametry produktu")
     ws5["A1"] = "Parametry użyte do generowania tytułów"
     ws5["A1"].font = Font(bold=True, size=12, name="Arial")
@@ -349,7 +426,6 @@ def build_excel(
     ws5.column_dimensions["A"].width = 25
     ws5.column_dimensions["B"].width = 70
 
-    # Zapis do bajtów
     buffer = BytesIO()
     wb.save(buffer)
     return buffer.getvalue()
@@ -358,70 +434,84 @@ def build_excel(
 # ===================== STREAMLIT UI =====================
 
 st.set_page_config(
-    page_title="Amazon DE - Generator Tytułów",
+    page_title="Amazon Multi-Language – Generator Tytułów",
     page_icon="📝",
     layout="wide",
 )
 
-st.title("📝 Amazon DE – Generator Tytułów")
+st.title("📝 Amazon Multi-Language – Generator Tytułów")
 st.caption(
-    "Wrzuć plik z Cerebro (Helium10), wklej tytuły konkurencji, "
-    "wpisz parametry produktu → wyjście to 3 wersje tytułu + Excel z analizą."
+    "Wybierz język rynku, wpisz parametry produktu (większość opcjonalnych) "
+    "i wygeneruj 3 wersje tytułu. Plik Cerebro i tytuły konkurencji są opcjonalne. "
+    "Po wygenerowaniu możesz przetłumaczyć tytuł na inny język rynku."
 )
 
-# === Sidebar: parametry produktu ===
-with st.sidebar:
-    st.header("🏷️ Parametry produktu")
+# Inicjalizacja session state
+if "generated" not in st.session_state:
+    st.session_state.generated = False
+if "titles_data" not in st.session_state:
+    st.session_state.titles_data = {}
+if "translated_data" not in st.session_state:
+    st.session_state.translated_data = {}
 
-    brand = st.text_input("Marka", placeholder="np. BIELIK", help="Pierwsze słowo tytułu")
-    main_kw = st.text_input(
-        "Główna fraza produktu",
-        placeholder="np. Sitzkissen Rund",
-        help="Najsilniejszy keyword - powinien być pierwszy po marce",
+# === Sidebar ===
+with st.sidebar:
+    st.header("🌍 Język / Kraj")
+    lang_code = st.selectbox(
+        "Język tytułu",
+        list(LANGUAGES.keys()),
+        format_func=lambda x: LANGUAGES[x]["name"],
+        index=0,
     )
-    size = st.text_input("Wymiar", placeholder="np. 40 cm albo 120x80")
-    set_size = st.selectbox(
-        "Set / ilość",
-        ["1 Stück", "2er Set", "3er Set", "4er Set", "6er Set", "8er Set"],
-        index=3,
-    )
-    material = st.text_input("Materiał", placeholder="np. Cord, Filz, Baumwolle")
 
     st.markdown("---")
-    st.subheader("Cechy produktu")
+    st.header("🏷️ Parametry produktu")
+    st.caption("⭐ = wymagane, reszta opcjonalna")
+
+    brand = st.text_input("⭐ Marka", placeholder="np. BIELIK")
+    main_kw = st.text_input(
+        "⭐ Główna fraza produktu",
+        placeholder="np. Sitzkissen Rund / Coussin Rond / Seat Cushion Round",
+    )
+    size = st.text_input("Wymiar (opcjonalnie)", placeholder="np. 40 cm albo 120x80")
+
+    set_options = list(LANGUAGES[lang_code]["set_sizes"].keys())
+    set_key = st.selectbox(
+        "Set / ilość (opcjonalnie)",
+        ["(brak)"] + set_options,
+        index=4,  # 4 szt. domyślnie
+    )
+    if set_key == "(brak)":
+        set_size = ""
+    else:
+        set_size = LANGUAGES[lang_code]["set_sizes"][set_key]
+
+    material = st.text_input("Materiał (opcjonalnie)", placeholder="np. Cord, Filz, Cotton")
+
     features_text = st.text_area(
-        "Cechy (jedna per linia)",
-        placeholder="waschbar\nrutschfest\nabnehmbar",
+        "Cechy (jedna per linia, opcjonalne)",
+        placeholder="waschbar\nrutschfest",
+        height=80,
+    )
+
+    synonyms_text = st.text_area(
+        "Synonimy (jedna per linia, opcjonalne)",
+        placeholder="Stuhlkissen\nBodenkissen",
         height=100,
     )
 
-    st.subheader("Synonimy / typy produktu")
-    synonyms_text = st.text_area(
-        "Synonimy (jedna per linia)",
-        placeholder="Stuhlkissen\nBodenkissen\nSitzpolster\nStuhlauflage",
-        height=120,
-        help="Skopiuj z tytułów konkurencji - jakie inne nazwy używają dla tego produktu",
-    )
-
-    st.subheader("Konteksty użycia")
     contexts_text = st.text_area(
-        "Konteksty (jeden per linia)",
-        placeholder="Esszimmer\nWohnzimmer\nKüche\nSitzbank\nHocker",
-        height=120,
-        help="Gdzie/do czego klienci wyszukują ten produkt",
+        "Konteksty (jeden per linia, opcjonalne)",
+        placeholder="Esszimmer\nKüche\nGarten",
+        height=100,
     )
 
-    st.markdown("---")
-    color = st.text_input(
-        "Kolor (opcjonalnie)",
-        placeholder="np. Anthrazit",
-        help="Pomiń jeśli to PARENT-tytuł wariantu kolorystycznego",
-    )
+    color = st.text_input("Kolor (opcjonalnie)", placeholder="np. Anthrazit")
 
     st.markdown("---")
-    no_commas = st.toggle("Bez przecinków w tytule", value=True)
+    no_commas = st.toggle("Bez przecinków", value=True)
     is_parent = st.toggle(
-        "To jest PARENT-tytuł (wariant kolorystyczny)",
+        "PARENT-tytuł (wariant kolorystyczny)",
         value=False,
         help="Parent NIE może mieć koloru w tytule",
     )
@@ -430,53 +520,44 @@ with st.sidebar:
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    st.subheader("1. Plik Cerebro (Helium10)")
+    st.subheader("📁 Plik Cerebro (opcjonalnie)")
     cerebro_file = st.file_uploader(
         "Wgraj plik .xlsx z eksportu Cerebro",
         type=["xlsx"],
-        help="Plik z keywordami, Search Volume, Keyword Sales",
+        help="Bez pliku też zadziała - po prostu nie będzie analizy keywordów w Excelu",
     )
 
 with col2:
-    st.subheader("2. Tytuły konkurencji")
+    st.subheader("📋 Tytuły konkurencji (opcjonalnie)")
     competitor_text = st.text_area(
         "Wklej tytuły konkurencji (jeden per linia)",
-        placeholder=(
-            "Lsjoaw Sitzkissen Rund 35cm Dicke 6cm 1 Stück Bodenkissen...\n"
-            "heimtexland® Sitzkissen Set Filz Stuhlkissen Type 631 35 cm Orange...\n"
-            "..."
-        ),
-        height=150,
+        placeholder="Lsjoaw Sitzkissen Rund 35cm...\nheimtexland Sitzkissen Filz...",
+        height=120,
     )
 
-# Backend keywords
-st.subheader("3. (Opcjonalnie) Słowa kluczowe do backendu")
+st.subheader("🔍 Słowa do backendu (opcjonalnie)")
 backend_text = st.text_area(
-    "Słowa do pola Schlüsselwörter (do 249 zn.) - nie wpisuj słów, które są już w tytule",
-    placeholder="kissen rund cordstoff sitzauflage rutschfest abnehmbar terrasse balkon...",
-    height=80,
+    "Słowa do pola Schlüsselwörter / Keywords (do 249 zn.)",
+    placeholder="np. dodatkowe synonimy lub literówki",
+    height=70,
 )
 
-# === Generowanie ===
+# === Przycisk Generuj ===
 st.markdown("---")
-
 if st.button("🚀 Generuj tytuły", type="primary", use_container_width=True):
-    # Walidacja wejścia
     if not brand or not main_kw:
         st.error("❌ Marka i Główna fraza są wymagane.")
         st.stop()
 
-    if not cerebro_file:
-        st.warning("⚠️ Brak pliku Cerebro - generuję bez analizy keywordów (Excel będzie pusty w arkuszu top).")
-        cerebro_df = pd.DataFrame(columns=["Keyword Phrase", "Search Volume", "Keyword Sales"])
-    else:
+    if cerebro_file:
         try:
             cerebro_df = parse_cerebro(cerebro_file)
         except ValueError as e:
             st.error(f"❌ {e}")
             st.stop()
+    else:
+        cerebro_df = pd.DataFrame(columns=["Keyword Phrase", "Search Volume", "Keyword Sales"])
 
-    # Parsowanie
     features = [f.strip() for f in features_text.split("\n") if f.strip()]
     synonyms = [s.strip() for s in synonyms_text.split("\n") if s.strip()]
     contexts = [c.strip() for c in contexts_text.split("\n") if c.strip()]
@@ -486,6 +567,7 @@ if st.button("🚀 Generuj tytuły", type="primary", use_container_width=True):
         color = ""
 
     common_args = {
+        "lang": lang_code,
         "brand": brand,
         "main_kw": main_kw,
         "size": size,
@@ -498,11 +580,10 @@ if st.button("🚀 Generuj tytuły", type="primary", use_container_width=True):
         "no_commas": no_commas,
     }
 
-    # Generuj 3 wersje z auto-trimowaniem
     titles_data = {}
     for style in ["A", "B", "C"]:
-        title = trim_to_fit(build_title, style=style, **common_args)
-        v = validate_title(title, no_commas=no_commas)
+        title = trim_to_fit(style=style, **common_args)
+        v = validate_title(title, lang=lang_code, no_commas=no_commas)
         titles_data[style] = {
             "title": title,
             "length": v["length"],
@@ -510,74 +591,137 @@ if st.button("🚀 Generuj tytuły", type="primary", use_container_width=True):
             "issues": v["issues"],
         }
 
-    # === Wyświetl wyniki ===
-    st.success("✅ Wygenerowano tytuły!")
+    # Zapis do session state
+    st.session_state.generated = True
+    st.session_state.titles_data = titles_data
+    st.session_state.lang_code = lang_code
+    st.session_state.cerebro_df = cerebro_df
+    st.session_state.competitor_titles = competitor_titles
+    st.session_state.backend_text = backend_text
+    st.session_state.no_commas = no_commas
+    st.session_state.product_params = {
+        "Język": LANGUAGES[lang_code]["name"],
+        "Marka": brand,
+        "Główna fraza": main_kw,
+        "Wymiar": size or "(brak)",
+        "Set": set_size or "(brak)",
+        "Materiał": material or "(brak)",
+        "Cechy": ", ".join(features) or "(brak)",
+        "Synonimy": ", ".join(synonyms) or "(brak)",
+        "Konteksty": ", ".join(contexts) or "(brak)",
+        "Kolor": color if color else "(parent / brak)",
+        "Bez przecinków": "Tak" if no_commas else "Nie",
+        "Parent-tytuł": "Tak" if is_parent else "Nie",
+    }
+    st.session_state.translated_data = {}  # reset tłumaczeń
+
+# === Wyświetlanie wyników ===
+if st.session_state.generated:
+    st.success(f"✅ Wygenerowano tytuły dla: **{LANGUAGES[st.session_state.lang_code]['name']}**")
 
     for style, label in [
         ("A", "🅰️ A – Klasyczny zlepek (max keywords)"),
         ("B", "🅱️ B – Hybryda (REKOMENDOWANE)"),
         ("C", "🅲 C – Zdaniowa naturalna"),
     ]:
-        data = titles_data[style]
+        data = st.session_state.titles_data[style]
         with st.expander(f"{label} ({data['length']} zn.)", expanded=(style == "B")):
             st.code(data["title"], language=None)
             if data["valid"]:
-                st.success("✅ Spełnia wszystkie reguły Amazon DE")
+                st.success("✅ Spełnia reguły Amazon")
             else:
                 st.error(f"❌ Problemy: {'; '.join(data['issues'])}")
             st.caption(f"Długość: **{data['length']}** / {TITLE_LIMIT} znaków")
 
-    # === Generowanie Excel ===
+    # === Sekcja tłumaczenia ===
+    st.markdown("---")
+    st.subheader("🌐 Przetłumacz na inny język")
+    st.caption(
+        "Słownikowe tłumaczenie strukturalne (bez analizy keywordów docelowego rynku). "
+        "Działa najlepiej dla branży home & garden. Słowa nieznane są zostawione "
+        "w oryginalnym języku - poprawisz je ręcznie albo dodaj do słownika."
+    )
+
+    available_targets = [c for c in LANGUAGES.keys() if c != st.session_state.lang_code]
+    target_langs = st.multiselect(
+        "Wybierz języki docelowe",
+        available_targets,
+        format_func=lambda x: LANGUAGES[x]["name"],
+    )
+
+    col_t1, col_t2 = st.columns([1, 3])
+    with col_t1:
+        translate_btn = st.button("🔄 Przetłumacz", type="secondary", use_container_width=True)
+
+    if translate_btn and target_langs:
+        translated_data = {}
+        for target in target_langs:
+            translated_titles = {}
+            for style in ["A", "B", "C"]:
+                src_title = st.session_state.titles_data[style]["title"]
+                t_title, unknown = translate_title(
+                    src_title, st.session_state.lang_code, target
+                )
+                translated_titles[style] = {"title": t_title, "unknown": unknown}
+            translated_data[target] = {"titles": translated_titles}
+        st.session_state.translated_data = translated_data
+
+    if st.session_state.translated_data:
+        for target, data in st.session_state.translated_data.items():
+            st.markdown(f"### {LANGUAGES[target]['name']}")
+            for style in ["A", "B", "C"]:
+                info = data["titles"][style]
+                with st.expander(f"Opcja {style} ({len(info['title'])} zn.)", expanded=(style == "B")):
+                    st.code(info["title"], language=None)
+                    if info["unknown"]:
+                        st.warning(
+                            f"⚠️ Słowa nieznane słownikowi (zostawione w oryginale): "
+                            f"`{', '.join(info['unknown'])}`"
+                        )
+                    else:
+                        st.success("✅ Wszystkie słowa przetłumaczone")
+
+    # === Pobieranie Excel ===
     st.markdown("---")
     st.subheader("📥 Pobierz analizę")
 
-    product_params = {
-        "Marka": brand,
-        "Główna fraza": main_kw,
-        "Wymiar": size,
-        "Set": set_size,
-        "Materiał": material,
-        "Cechy": ", ".join(features),
-        "Synonimy": ", ".join(synonyms),
-        "Konteksty": ", ".join(contexts),
-        "Kolor": color if color else "(parent - brak)",
-        "Bez przecinków": "Tak" if no_commas else "Nie",
-        "Parent-tytuł": "Tak" if is_parent else "Nie",
-    }
-
     excel_bytes = build_excel(
-        titles=titles_data,
-        cerebro_df=cerebro_df,
-        competitor_titles=competitor_titles,
-        backend_terms=backend_text,
-        product_params=product_params,
+        titles=st.session_state.titles_data,
+        cerebro_df=st.session_state.cerebro_df,
+        competitor_titles=st.session_state.competitor_titles,
+        backend_terms=st.session_state.backend_text,
+        product_params=st.session_state.product_params,
+        translated=st.session_state.translated_data if st.session_state.translated_data else None,
     )
 
-    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", main_kw)[:30] or "tytul"
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", st.session_state.product_params["Główna fraza"])[:30] or "tytul"
     st.download_button(
         label="⬇️ Pobierz plik Excel",
         data=excel_bytes,
-        file_name=f"Amazon_DE_tytul_{safe_name}.xlsx",
+        file_name=f"Amazon_{st.session_state.lang_code}_tytul_{safe_name}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
 
     # === Dodatkowa analiza ===
-    if competitor_titles:
+    if st.session_state.competitor_titles:
         with st.expander("🔍 Słowa najczęściej używane przez konkurencję", expanded=False):
-            kws = extract_keywords_from_titles(competitor_titles)
+            kws = extract_keywords_from_titles(
+                st.session_state.competitor_titles,
+                LANGUAGES[st.session_state.lang_code]["exempt_words"],
+            )
             df_kw = pd.DataFrame(kws, columns=["Słowo", "Liczba wystąpień"])
             st.dataframe(df_kw, use_container_width=True, hide_index=True)
 
-    if not cerebro_df.empty:
+    if not st.session_state.cerebro_df.empty:
         with st.expander("📊 Top 20 keywordów z Cerebro", expanded=False):
-            display = cerebro_df.head(20)[
+            display = st.session_state.cerebro_df.head(20)[
                 ["Keyword Phrase", "Search Volume", "Keyword Sales"]
             ]
             st.dataframe(display, use_container_width=True, hide_index=True)
 
 else:
     st.info(
-        "👈 Wypełnij parametry produktu w panelu po lewej, wgraj plik Cerebro "
-        "i wklej tytuły konkurencji, a następnie kliknij **Generuj tytuły**."
+        "👈 Wybierz język, wypełnij markę i główną frazę (reszta opcjonalna), "
+        "a następnie kliknij **Generuj tytuły**."
     )
