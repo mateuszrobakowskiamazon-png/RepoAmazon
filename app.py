@@ -13,7 +13,7 @@ import streamlit as st
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
-from languages import LANGUAGES, TRANSLATIONS
+from languages import CATEGORIES, LANGUAGES, TRANSLATIONS
 
 
 # ===================== STAŁE =====================
@@ -48,6 +48,202 @@ def extract_keywords_from_titles(titles: list[str], exempt: set) -> list[tuple[s
         words = re.findall(r"[A-Za-zÄÖÜäöüßéèêàâçñíóúÁÉÍÓÚłąęśćźżńŁŚŻŹĆĄĘŃÅÄÖå]+", t.lower())
         all_words.extend(w for w in words if w not in exempt and len(w) > 3)
     return Counter(all_words).most_common(20)
+
+
+# ===================== AUTO-EKSTRAKCJA Z KONKURENCJI + CEREBRO =====================
+
+def build_word_to_de_key_map() -> dict:
+    """Mapa: dowolne słowo (w dowolnym języku, lowercase) → klucz niemiecki."""
+    mapping = {}
+    for de_word, langs in TRANSLATIONS.items():
+        mapping[de_word.lower()] = de_word
+        for _, translation in langs.items():
+            mapping[translation.lower()] = de_word
+            # Dla wielowyrazowych ("Coussin de Chaise") - dodaj też pierwsze słowo
+            first_word = translation.split()[0].lower()
+            if first_word not in mapping:
+                mapping[first_word] = de_word
+    return mapping
+
+
+def classify_word(word: str, word_map: dict) -> tuple[str | None, str | None]:
+    """Zwraca (kategoria, klucz_DE) lub (None, None) jeśli nie rozpoznane."""
+    word_lower = word.lower().strip(".,;:")
+    if word_lower in word_map:
+        de_key = word_map[word_lower]
+        return CATEGORIES.get(de_key), de_key
+    return None, None
+
+
+def extract_from_competitor_titles(
+    titles: list[str], lang: str, main_kw_words: set
+) -> dict:
+    """
+    Analizuje tytuły konkurencji, wyciąga słowa per kategoria.
+    Zwraca dict {synonyms, contexts, features, materials, colors, shape}.
+    Słowa wyrażone już w main_kw są pomijane (nie chcemy duplikatów).
+    """
+    word_map = build_word_to_de_key_map()
+
+    categorized = {
+        "products": Counter(),   # → synonimy
+        "context": Counter(),
+        "feature": Counter(),
+        "material": Counter(),
+        "color": Counter(),
+        "shape": Counter(),
+    }
+
+    # Tokenizuj wszystkie tytuły, klasyfikuj słowa
+    for title in titles:
+        # Dla 2-wyrazowych fraz typu "Memory Foam", "Cuscino Sedia" - sprawdź również pary
+        words = re.findall(r"[A-Za-zÄÖÜäöüßéèêàâçñíóúÁÉÍÓÚłąęśćźżńŁŚŻŹĆĄĘŃÅÄÖå]+", title)
+        seen_in_title = set()
+
+        # Najpierw bigramy
+        for i in range(len(words) - 1):
+            bigram = f"{words[i]} {words[i+1]}".lower()
+            if bigram in word_map:
+                de_key = word_map[bigram]
+                cat = CATEGORIES.get(de_key)
+                if cat and de_key not in seen_in_title:
+                    seen_in_title.add(de_key)
+                    target_cat = "products" if cat == "product" else cat
+                    if target_cat in categorized:
+                        # Tłumaczymy klucz DE na język docelowy
+                        translated = TRANSLATIONS.get(de_key, {}).get(lang, de_key) if lang != "DE" else de_key
+                        categorized[target_cat][translated] += 1
+
+        # Potem pojedyncze słowa
+        for word in words:
+            cat, de_key = classify_word(word, word_map)
+            if cat and de_key not in seen_in_title:
+                seen_in_title.add(de_key)
+                target_cat = "products" if cat == "product" else cat
+                if target_cat in categorized:
+                    if de_key.lower() in main_kw_words:
+                        continue  # nie duplikuj main_kw
+                    translated = TRANSLATIONS.get(de_key, {}).get(lang, de_key) if lang != "DE" else de_key
+                    categorized[target_cat][translated] += 1
+
+    # Wybierz słowa które pojawiają się co najmniej raz, posortowane po częstości
+    def top_words(counter: Counter, min_count: int = 1, max_n: int = 8) -> list[str]:
+        return [w for w, c in counter.most_common(max_n) if c >= min_count]
+
+    return {
+        "synonyms": top_words(categorized["products"], min_count=1, max_n=6),
+        "contexts": top_words(categorized["context"], min_count=1, max_n=6),
+        "features": top_words(categorized["feature"], min_count=1, max_n=4),
+        "materials": top_words(categorized["material"], min_count=1, max_n=2),
+        "colors": top_words(categorized["color"], min_count=1, max_n=2),
+        "shapes": top_words(categorized["shape"], min_count=1, max_n=1),
+    }
+
+
+def extract_main_kw_from_cerebro(df: pd.DataFrame, top_n: int = 3) -> list[str]:
+    """Wyciąga top N keywordów po Search Volume, w Title Case."""
+    if df.empty:
+        return []
+    return [kw.title() for kw in df.head(top_n)["Keyword Phrase"].tolist()]
+
+
+def extract_dimensions(text: str) -> str | None:
+    """Wyciąga wymiar typu '40 cm', '120x80', 'ø35cm' z tekstu."""
+    # 40 cm, 40cm
+    m = re.search(r"\b(\d{2,3})\s*cm\b", text, re.IGNORECASE)
+    if m:
+        return f"{m.group(1)} cm"
+    # 120x80, 120 x 80
+    m = re.search(r"\b(\d{2,3})\s*x\s*(\d{2,3})\b", text, re.IGNORECASE)
+    if m:
+        return f"{m.group(1)}x{m.group(2)}"
+    # ø35, ø 35
+    m = re.search(r"ø\s*(\d{2,3})", text, re.IGNORECASE)
+    if m:
+        return f"{m.group(1)} cm"
+    return None
+
+
+def extract_set_size(text: str, lang: str) -> str | None:
+    """Wyciąga 'set/lot/pack' z tytułu."""
+    patterns = [
+        (r"\b(\d+)er\s*Set\b", "DE"),
+        (r"\bLot\s*de\s*(\d+)\b", "FR"),
+        (r"\bSet\s*da\s*(\d+)\b", "IT"),
+        (r"\bPack\s*de\s*(\d+)\b", "ES"),
+        (r"\bSet\s*van\s*(\d+)\b", "NL"),
+        (r"\bSet\s*om\s*(\d+)\b", "SE"),
+        (r"\bSet\s*of\s*(\d+)\b", "EN"),
+        (r"\bZestaw\s*(\d+)\s*szt\b", "PL"),
+        (r"\b(\d+)er-Set\b", "DE"),
+        (r"\b(\d+)-pack\b", "EN"),
+    ]
+    for pat, _ in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            num = m.group(1)
+            key = f"{num} szt."
+            if key in LANGUAGES[lang]["set_sizes"]:
+                return LANGUAGES[lang]["set_sizes"][key]
+    return None
+
+
+def auto_extract_all(
+    cerebro_df: pd.DataFrame,
+    competitor_titles: list[str],
+    lang: str,
+    user_main_kw: str = "",
+) -> dict:
+    """
+    Pełna ekstrakcja - łączy dane z Cerebro i tytułów konkurencji.
+    Zwraca słownik z polami do auto-wypełnienia w UI.
+    """
+    result = {
+        "main_kw_suggestions": [],
+        "main_kw": "",
+        "size": "",
+        "set_size": "",
+        "material": "",
+        "color": "",
+        "shape": "",
+        "synonyms": [],
+        "contexts": [],
+        "features": [],
+    }
+
+    # Sugestie main_kw z Cerebro (top SV)
+    cerebro_top = extract_main_kw_from_cerebro(cerebro_df, top_n=3)
+    result["main_kw_suggestions"] = cerebro_top
+    if cerebro_top and not user_main_kw:
+        result["main_kw"] = cerebro_top[0]
+
+    main_kw_to_use = user_main_kw or result["main_kw"]
+    main_kw_words = set(main_kw_to_use.lower().split())
+
+    # Analiza tytułów konkurencji
+    if competitor_titles:
+        extracted = extract_from_competitor_titles(competitor_titles, lang, main_kw_words)
+        result["synonyms"] = extracted["synonyms"]
+        result["contexts"] = extracted["contexts"]
+        result["features"] = extracted["features"]
+        result["material"] = extracted["materials"][0] if extracted["materials"] else ""
+        result["color"] = extracted["colors"][0] if extracted["colors"] else ""
+        result["shape"] = extracted["shapes"][0] if extracted["shapes"] else ""
+
+        # Wymiar i set - z najczęstszego tytułu (pierwszego)
+        for title in competitor_titles:
+            if not result["size"]:
+                size = extract_dimensions(title)
+                if size:
+                    result["size"] = size
+            if not result["set_size"]:
+                ss = extract_set_size(title, lang)
+                if ss:
+                    result["set_size"] = ss
+            if result["size"] and result["set_size"]:
+                break
+
+    return result
 
 
 # ===================== WALIDACJA =====================
@@ -453,6 +649,8 @@ if "titles_data" not in st.session_state:
     st.session_state.titles_data = {}
 if "translated_data" not in st.session_state:
     st.session_state.translated_data = {}
+if "auto_filled" not in st.session_state:
+    st.session_state.auto_filled = {}
 
 # === Sidebar ===
 with st.sidebar:
@@ -466,47 +664,80 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("🏷️ Parametry produktu")
-    st.caption("⭐ = wymagane, reszta opcjonalna")
+    st.caption("⭐ = wymagane. Pozostałe wypełnij ręcznie lub użyj „🤖 Auto-wypełnij” na górze.")
 
-    brand = st.text_input("⭐ Marka", placeholder="np. BIELIK")
+    af = st.session_state.auto_filled
+
+    brand = st.text_input("⭐ Marka", placeholder="np. BIELIK", key="brand_input")
     main_kw = st.text_input(
         "⭐ Główna fraza produktu",
-        placeholder="np. Sitzkissen Rund / Coussin Rond / Seat Cushion Round",
+        value=af.get("main_kw", ""),
+        placeholder="np. Sitzkissen Rund",
+        key="main_kw_input",
+        help="Z Cerebro: top fraza po Search Volume. Auto-wypełniana po kliknięciu „Auto-wypełnij”.",
     )
-    size = st.text_input("Wymiar (opcjonalnie)", placeholder="np. 40 cm albo 120x80")
+    size = st.text_input(
+        "Wymiar",
+        value=af.get("size", ""),
+        placeholder="np. 40 cm albo 120x80",
+        key="size_input",
+    )
 
     set_options = list(LANGUAGES[lang_code]["set_sizes"].keys())
-    set_key = st.selectbox(
-        "Set / ilość (opcjonalnie)",
-        ["(brak)"] + set_options,
-        index=4,  # 4 szt. domyślnie
-    )
-    if set_key == "(brak)":
-        set_size = ""
-    else:
-        set_size = LANGUAGES[lang_code]["set_sizes"][set_key]
+    # Wybierz domyślny set na podstawie auto-wypełnienia
+    auto_set = af.get("set_size", "")
+    default_index = 0
+    if auto_set:
+        for i, key in enumerate(set_options):
+            if LANGUAGES[lang_code]["set_sizes"][key] == auto_set:
+                default_index = i + 1  # +1 bo dodajemy "(brak)" na początku
+                break
 
-    material = st.text_input("Materiał (opcjonalnie)", placeholder="np. Cord, Filz, Cotton")
+    set_key = st.selectbox(
+        "Set / ilość",
+        ["(brak)"] + set_options,
+        index=default_index,
+        key="set_input",
+    )
+    set_size = "" if set_key == "(brak)" else LANGUAGES[lang_code]["set_sizes"][set_key]
+
+    material = st.text_input(
+        "Materiał",
+        value=af.get("material", ""),
+        placeholder="np. Cord, Filz, Cotton",
+        key="material_input",
+    )
 
     features_text = st.text_area(
-        "Cechy (jedna per linia, opcjonalne)",
+        "Cechy (jedna per linia)",
+        value="\n".join(af.get("features", [])),
         placeholder="waschbar\nrutschfest",
         height=80,
+        key="features_input",
     )
 
     synonyms_text = st.text_area(
-        "Synonimy (jedna per linia, opcjonalne)",
+        "Synonimy (jeden per linia)",
+        value="\n".join(af.get("synonyms", [])),
         placeholder="Stuhlkissen\nBodenkissen",
-        height=100,
+        height=120,
+        key="synonyms_input",
     )
 
     contexts_text = st.text_area(
-        "Konteksty (jeden per linia, opcjonalne)",
+        "Konteksty (jeden per linia)",
+        value="\n".join(af.get("contexts", [])),
         placeholder="Esszimmer\nKüche\nGarten",
-        height=100,
+        height=120,
+        key="contexts_input",
     )
 
-    color = st.text_input("Kolor (opcjonalnie)", placeholder="np. Anthrazit")
+    color = st.text_input(
+        "Kolor",
+        value=af.get("color", ""),
+        placeholder="np. Anthrazit",
+        key="color_input",
+    )
 
     st.markdown("---")
     no_commas = st.toggle("Bez przecinków", value=True)
@@ -517,29 +748,90 @@ with st.sidebar:
     )
 
 # === Główne pole ===
+st.subheader("📥 Wgraj dane wejściowe")
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    st.subheader("📁 Plik Cerebro (opcjonalnie)")
     cerebro_file = st.file_uploader(
-        "Wgraj plik .xlsx z eksportu Cerebro",
+        "📁 Plik Cerebro (Helium10) - .xlsx",
         type=["xlsx"],
-        help="Bez pliku też zadziała - po prostu nie będzie analizy keywordów w Excelu",
+        help="Eksport z Cerebro z keywordami, Search Volume, Keyword Sales",
     )
+    if cerebro_file:
+        st.success(f"✅ Wgrano: {cerebro_file.name}")
 
 with col2:
-    st.subheader("📋 Tytuły konkurencji (opcjonalnie)")
     competitor_text = st.text_area(
-        "Wklej tytuły konkurencji (jeden per linia)",
-        placeholder="Lsjoaw Sitzkissen Rund 35cm...\nheimtexland Sitzkissen Filz...",
-        height=120,
+        "📋 Tytuły konkurencji (jeden per linia)",
+        placeholder="Lsjoaw Sitzkissen Rund 35cm Dicke 6cm 1 Stück Bodenkissen...\nheimtexland Sitzkissen Set Filz Stuhlkissen Type 631...",
+        height=150,
+        key="competitor_text_input",
     )
 
+# === Przycisk Auto-wypełnij ===
+if cerebro_file or competitor_text.strip():
+    if st.button(
+        "🤖 Auto-wypełnij parametry z Cerebro + konkurencji",
+        use_container_width=True,
+        type="secondary",
+    ):
+        # Parsuj Cerebro
+        if cerebro_file:
+            try:
+                cerebro_df = parse_cerebro(cerebro_file)
+                st.session_state.cerebro_df = cerebro_df
+            except ValueError as e:
+                st.error(f"❌ {e}")
+                cerebro_df = pd.DataFrame()
+        else:
+            cerebro_df = pd.DataFrame(columns=["Keyword Phrase", "Search Volume", "Keyword Sales"])
+            st.session_state.cerebro_df = cerebro_df
+
+        # Parsuj konkurencję
+        competitor_titles = parse_competitor_titles(competitor_text)
+        st.session_state.competitor_titles = competitor_titles
+
+        # Auto-ekstrakcja
+        existing_main_kw = st.session_state.get("main_kw_input", "")
+        extracted = auto_extract_all(
+            cerebro_df, competitor_titles, lang_code, existing_main_kw
+        )
+
+        st.session_state.auto_filled = extracted
+
+        # Komunikat sukcesu z podsumowaniem
+        summary = []
+        if extracted["main_kw"]:
+            summary.append(f"główna fraza: **{extracted['main_kw']}**")
+        if extracted["synonyms"]:
+            summary.append(f"{len(extracted['synonyms'])} synonimów")
+        if extracted["contexts"]:
+            summary.append(f"{len(extracted['contexts'])} kontekstów")
+        if extracted["features"]:
+            summary.append(f"{len(extracted['features'])} cech")
+        if extracted["material"]:
+            summary.append(f"materiał: **{extracted['material']}**")
+
+        st.success(
+            f"✅ Auto-wypełniono parametry: {', '.join(summary)}. "
+            "Sprawdź sidebar po lewej i edytuj jeśli chcesz, potem kliknij **Generuj**."
+        )
+
+        # Pokaż top SV z Cerebro
+        if extracted["main_kw_suggestions"]:
+            with st.expander("📊 Sugestie głównej frazy (top SV z Cerebro)", expanded=True):
+                for i, kw in enumerate(extracted["main_kw_suggestions"], 1):
+                    st.write(f"{i}. **{kw}**")
+
+        st.rerun()
+
+st.markdown("---")
 st.subheader("🔍 Słowa do backendu (opcjonalnie)")
 backend_text = st.text_area(
     "Słowa do pola Schlüsselwörter / Keywords (do 249 zn.)",
     placeholder="np. dodatkowe synonimy lub literówki",
     height=70,
+    key="backend_input",
 )
 
 # === Przycisk Generuj ===
@@ -549,19 +841,29 @@ if st.button("🚀 Generuj tytuły", type="primary", use_container_width=True):
         st.error("❌ Marka i Główna fraza są wymagane.")
         st.stop()
 
-    if cerebro_file:
+    # Cerebro - z session_state jeśli już sparsowane, lub świeże
+    if "cerebro_df" in st.session_state and not st.session_state.cerebro_df.empty:
+        cerebro_df = st.session_state.cerebro_df
+    elif cerebro_file:
         try:
             cerebro_df = parse_cerebro(cerebro_file)
+            st.session_state.cerebro_df = cerebro_df
         except ValueError as e:
             st.error(f"❌ {e}")
             st.stop()
     else:
         cerebro_df = pd.DataFrame(columns=["Keyword Phrase", "Search Volume", "Keyword Sales"])
+        st.session_state.cerebro_df = cerebro_df
+
+    competitor_titles = (
+        st.session_state.get("competitor_titles")
+        or parse_competitor_titles(competitor_text)
+    )
+    st.session_state.competitor_titles = competitor_titles
 
     features = [f.strip() for f in features_text.split("\n") if f.strip()]
     synonyms = [s.strip() for s in synonyms_text.split("\n") if s.strip()]
     contexts = [c.strip() for c in contexts_text.split("\n") if c.strip()]
-    competitor_titles = parse_competitor_titles(competitor_text)
 
     if is_parent:
         color = ""

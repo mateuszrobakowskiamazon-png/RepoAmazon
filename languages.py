@@ -373,3 +373,46 @@ TRANSLATIONS = {
                     "SE": "Europall", "EN": "Euro Pallet",
                     "PL": "Europaleta"},
 }
+
+
+# Kategoryzacja słów - klucz = niemieckie słowo, wartość = kategoria
+# Używane do auto-wyciągania danych z tytułów konkurencji
+CATEGORIES = {
+    # Produkty główne (mogą być main_kw lub synonimem)
+    "Sitzkissen": "product", "Stuhlkissen": "product", "Bodenkissen": "product",
+    "Sitzpolster": "product", "Stuhlauflage": "product", "Palettenkissen": "product",
+    "Palettenauflagen": "product", "Palettenpolster": "product",
+    "Palettensofa": "product", "Palettenmöbel": "product", "Rückenlehne": "product",
+    "Kissen": "product", "Polster": "product", "Auflage": "product", "Sofa": "product",
+
+    # Kształty
+    "Rund": "shape", "Eckig": "shape", "Quadrat": "shape", "Quadratisch": "shape",
+    "Rechteckig": "shape", "Oval": "shape",
+
+    # Materiały
+    "Cord": "material", "Filz": "material", "Baumwolle": "material",
+    "Polyester": "material", "Schaumstoff": "material", "Memory Foam": "material",
+    "Leinen": "material",
+
+    # Kolory
+    "Anthrazit": "color", "Grau": "color", "Hellgrau": "color", "Dunkelgrau": "color",
+    "Beige": "color", "Schwarz": "color", "Weiß": "color", "Braun": "color",
+    "Rot": "color", "Blau": "color", "Grün": "color", "Gelb": "color",
+    "Cremeweiß": "color",
+
+    # Cechy
+    "waschbar": "feature", "rutschfest": "feature", "wasserdicht": "feature",
+    "wetterfest": "feature", "abnehmbar": "feature", "gesteppt": "feature",
+    "atmungsaktiv": "feature",
+
+    # Konteksty (gdzie używać produktu)
+    "Esszimmer": "context", "Wohnzimmer": "context", "Schlafzimmer": "context",
+    "Küche": "context", "Garten": "context", "Balkon": "context",
+    "Terrasse": "context", "Büro": "context", "Konferenzraum": "context",
+    "Indoor": "context", "Outdoor": "context",
+
+    # Meble (na czym się używa - też kontekst, ale meble)
+    "Stuhl": "context", "Bank": "context", "Sitzbank": "context",
+    "Hocker": "context", "Bürostuhl": "context",
+    "Europaletten": "context", "Europalette": "context",
+}
